@@ -179,6 +179,12 @@ The daemon writes the file atomically (temp + `rename`), so node_exporter never
 reads a half-written file. Export runs inside its own error guard — a telemetry
 failure can never interrupt fan control.
 
+**`--monitor` mode:** run `strix-halo-fand --monitor` to leave the fan on the
+firmware's own curve while still exporting metrics. It never drives the fan — it
+only observes. This is how the [A/B test](#ab-test-daemon-vs-stock-firmware) above
+was measured: stop the normal service, run `--monitor` so Prometheus keeps
+scraping, and you can watch the stock firmware let the chip cook in real time.
+
 ## Adapting to your board
 
 The register offsets are **specific to the Bosgame M5 / IT5570**. On a different

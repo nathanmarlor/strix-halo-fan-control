@@ -126,14 +126,16 @@ def read_tach():
     return _last_rpm
 
 
-def write_metrics(readings, duty):
+def write_metrics(readings):
     if not PROM_FILE:
         return
     try:                                      # telemetry must NEVER break fan control
-        L = ["# TYPE strixhalo_fan_duty_percent gauge"]
-        L.append('strixhalo_fan_duty_percent{fan="1"} %d' % duty)
-        if FAN2 is not None:
-            L.append('strixhalo_fan_duty_percent{fan="2"} %d' % duty)
+        ecb = ec_read()                       # duty read back from the EC -> correct in
+        L = ["# TYPE strixhalo_fan_duty_percent gauge"]   # both manual and firmware-auto
+        if ecb:
+            L.append('strixhalo_fan_duty_percent{fan="1"} %d' % (ecb[FAN1] & 0x7f))
+            if FAN2 is not None:
+                L.append('strixhalo_fan_duty_percent{fan="2"} %d' % (ecb[FAN2] & 0x7f))
         rpm = read_tach()
         L.append("# TYPE strixhalo_fan_rpm gauge")
         for i in sorted(rpm):
@@ -156,30 +158,42 @@ def on_exit(*_):
 
 
 def main():
-    if len(sys.argv) > 1 and sys.argv[1] == "--auto":
+    arg = sys.argv[1] if len(sys.argv) > 1 else None
+    if arg == "--auto":                       # hand the fan back to firmware and exit
         set_auto()
         return
+    # --monitor: leave the fan on the firmware's own curve but keep exporting metrics.
+    # Useful for measuring stock behaviour (e.g. an A/B against this daemon) without
+    # losing observability. No effect on cooling -- it never drives the fan.
+    monitor = arg == "--monitor"
     if not SENSORS:
         print("no temp sensors found among %s; aborting" % TEMP_SOURCES, file=sys.stderr)
         sys.exit(1)
     signal.signal(signal.SIGTERM, on_exit)
     signal.signal(signal.SIGINT, on_exit)
+    if monitor:
+        set_auto()                            # release the fan to firmware once
     n = 0
     while True:
         try:
             readings = [(name, read_temp(p)) for name, p in SENSORS]
             readings = [(name, t) for name, t in readings if t is not None]
-            if not readings:
+            if monitor:
+                pass                          # fan left on firmware auto; only observe
+            elif not readings:
                 set_auto()                    # can't read temp -> firmware auto
             else:
+                set_duty(duty_for(max(t for _, t in readings)))
+            write_metrics(readings)
+            if n % 15 == 0 and readings:      # ~every 30s at 2s interval
                 t = max(t for _, t in readings)
-                d = duty_for(t)
-                set_duty(d)
-                write_metrics(readings, d)
-                if n % 15 == 0:               # ~every 30s at 2s interval
-                    print("temp=%.0fC -> fan=%d%%" % (t, d), flush=True)
+                if monitor:
+                    print("monitor: %.0fC, fan=firmware-auto" % t, flush=True)
+                else:
+                    print("temp=%.0fC -> fan=%d%%" % (t, duty_for(t)), flush=True)
         except Exception as e:                # never let a control error persist
-            set_auto()
+            if not monitor:
+                set_auto()
             print("error: %s -> firmware auto" % e, flush=True)
         n += 1
         time.sleep(INTERVAL)
