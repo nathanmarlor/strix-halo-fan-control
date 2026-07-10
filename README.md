@@ -8,6 +8,14 @@ Validated on the **Bosgame M5** (ITE **IT5570** Embedded Controller). The approa
 generalises to other Strix Halo boxes, but the exact EC register offsets may
 differ — see [Adapting to your board](#adapting-to-your-board) before running.
 
+> **Which should you use?** For most people the
+> [`ec-su_axb35` kernel driver](https://github.com/cmetz/ec-su_axb35-linux) is the
+> better fix: a native driver that controls **all three** fans off the EC's accurate
+> temperature sensor (measured ~5 °C cooler than this daemon on the same box). This
+> project is the **dependency-free userspace alternative** — one Python file, no
+> module to build — and a from-scratch **reverse-engineering writeup** of how the EC
+> fan control actually works. Both simply drive the fans off an aggressive curve.
+
 ## Why this exists
 
 These mini-PCs pack a 16-core CPU + 40-CU iGPU sharing a single power/thermal
@@ -79,36 +87,40 @@ daemon's win is purely *thermal*: it keeps the die ~20 °C cooler, so the *therm
 throttle never triggers and clocks stay pinned at maximum. (The throttle reasons
 `thm_core`/`pwr_spl` are read straight from the AMD `gpu_metrics` residency counters.)
 
-## Root cause: the firmware can't see the GPU heat
+> **Method note:** the "firmware" column was produced by *releasing* EC fan control
+> (writing `0x00`), which on this board does **not** re-engage the EC's real auto
+> curve — it just pins the fan low. So this really measures *daemon vs. no active
+> control*. The genuine stock auto curve does ramp, but lazily (see
+> [Root cause](#root-cause-the-stock-fan-curve-is-tuned-to-stay-quiet)) — it still
+> lets the chip reach ~95 °C before the fan nears maximum.
 
-Why doesn't the stock firmware just ramp the fan? It was traced through three
-layers on the Bosgame M5:
+## Root cause: the stock fan curve is tuned to stay quiet
 
-1. **Fan control is 100% EC-internal.** The ACPI DSDT has **zero thermal zones** —
-   the OS has no fan policy at all, only get/set methods. The entire curve lives in
-   the EC firmware.
-2. **The EC's CPU sensor is accurate.** Logging the EC's own temperature registers
-   against the real die temperature under load shows `CPUT` (EC RAM `0x70`) tracks
-   the die within ~1 °C. So "the sensor lags the die" is *not* the problem.
-3. **The GPU-temperature channel is dead.** `GPUT` (EC RAM `0x71`) reads **`0` the
-   entire time**, even under full iGPU load with the die at 73 °C:
+Why doesn't the stock firmware ramp the fan under sustained load? The
+[ec-su_axb35 driver](https://github.com/cmetz/ec-su_axb35-linux) exposes the EC's
+actual fan curve, which answers it directly — the stock ramp-up trip points (the °C
+at which each fan step engages) are:
 
-   | die (gfx) | `CPUT` (0x70) | `GPUT` (0x71) |
-   |-----------|---------------|---------------|
-   | 41 °C | 42 | **0** |
-   | 62 °C | 58 | **0** |
-   | 73 °C | 72 | **0** |
+    60, 70, 83, 95, 97
 
-So the fan isn't weak (it does 4200 rpm on command) and the sensor isn't lagging
-(`CPUT` is accurate) — the EC's fan curve simply **never acts on the temperature
-that's rising**, because it is keyed to a `GPUT` channel that is stuck at zero and/or
-has absurdly high `CPUT` trip points. GPU-compute load is **thermally invisible** to
-the stock fan controller.
+The fan only reaches its **top levels at 95–97 °C** — right at Tjmax. It is
+deliberately tuned for quiet, so under sustained compute the chip is simply
+*allowed* to sit at ~95 °C and throttle rather than spin the fan up. (This is why
+you never hear the fan react on a stock unit — the silence is the symptom.)
 
-That is exactly why these boxes cook specifically under **local LLM inference**: it
-is a pure-iGPU compute load, and the one channel that would spin the fan up is
-broken. This daemon sidesteps the whole thing by driving the fan off the real die
-temperature directly.
+It is **not** a sensor or hardware limit:
+
+- **The EC's temperature is accurate.** `CPUT` (EC RAM `0x70` — the register the
+  curve reads) tracks the real die within ~1 °C under load.
+- **The fans are capable** — they do 4000+ rpm on command.
+
+So the fix is just to drive the fans off an *aggressive* curve instead: this daemon
+does it from userspace (off the die temperature), and the kernel driver does it in
+the EC if you give it an aggressive curve.
+
+(Aside: the EC's separate *GPU* temperature register `GPUT` at `0x71` reads 0 on
+this board — a real quirk — but the fan curve is keyed to `CPUT`, so it is not the
+cause.)
 
 ## How it works
 
