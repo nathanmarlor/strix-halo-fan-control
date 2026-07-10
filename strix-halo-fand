@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""
+strix-halo-fand: direct Embedded-Controller fan control for AMD Strix Halo
+(Ryzen AI Max+ 395) mini-PCs whose firmware locks the fan curve and exposes
+no standard Linux fan control (no hwmon PWM, no fan tach, no ACPI fan object).
+
+Validated on the Bosgame M5 (ITE IT5570 EC). The EC register offsets below were
+reverse-engineered from the board's ACPI DSDT. They may differ on other boards --
+see README ("Adapting to your board") before running.
+
+Fail-safe by design:
+  * the curve only ever cools *harder* than stock -- it never sets a low duty at
+    high temp;
+  * on ANY error (unreadable temp, EC write failure) or on stop/SIGTERM it writes
+    0x00 to hand the fan back to the firmware's own auto curve;
+  * a minimum-duty floor keeps airflow up even if something wedges.
+
+You are still poking an Embedded Controller. Use at your own risk. The worst
+realistic outcome is a fan stuck at 100% (loud, but safe) until reboot.
+"""
+import glob, time, os, signal, sys
+
+# ---------------- CONFIG (verify for your board -- see README) ----------------
+EC    = "/sys/kernel/debug/ec/ec0/io"   # kernel ec_sys write interface
+FAN1  = 0x33            # fan1 duty register (write 0x80|duty; 0x00 = firmware auto)
+FAN2  = 0x34            # fan2 duty register; set to None for a single-fan board
+INTERVAL = 2.0         # seconds between updates
+FLOOR = 30             # minimum duty %% -- never starve airflow
+# Fan curve: (temp_below_degC, duty_percent), ascending. Tune to taste.
+# This default is "max performance": ramps hard, 100%% by 82 C.
+CURVE = [(50, 45), (60, 55), (70, 70), (78, 85), (82, 95), (999, 100)]
+# Temp sources: hwmon driver names; the daemon drives off the HOTTEST of these.
+TEMP_SOURCES = ["amdgpu", "k10temp"]
+# -----------------------------------------------------------------------------
+
+
+def find_hwmon(name):
+    for p in glob.glob("/sys/class/hwmon/hwmon*"):
+        try:
+            if open(p + "/name").read().strip() == name:
+                return p
+        except OSError:
+            pass
+    return None
+
+
+SENSORS = [p for p in (find_hwmon(n) for n in TEMP_SOURCES) if p]
+
+
+def read_temp(path):
+    try:
+        return int(open(path + "/temp1_input").read()) / 1000.0
+    except OSError:
+        return None
+
+
+def ec_write(offset, byte):
+    with open(EC, "r+b") as f:
+        f.seek(offset)
+        f.write(bytes([byte]))
+
+
+def set_duty(pct):
+    pct = max(FLOOR, min(100, int(pct)))
+    ec_write(FAN1, 0x80 | pct)               # bit7 = manual override
+    if FAN2 is not None:
+        ec_write(FAN2, 0x80 | pct)
+
+
+def set_auto():
+    try:
+        ec_write(FAN1, 0x00)                  # hand back to firmware auto curve
+        if FAN2 is not None:
+            ec_write(FAN2, 0x00)
+    except OSError:
+        pass
+
+
+def duty_for(temp):
+    for ceiling, duty in CURVE:
+        if temp < ceiling:
+            return duty
+    return 100
+
+
+def on_exit(*_):
+    set_auto()
+    sys.exit(0)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--auto":
+        set_auto()
+        return
+    if not SENSORS:
+        print("no temp sensors found among %s; aborting" % TEMP_SOURCES, file=sys.stderr)
+        sys.exit(1)
+    signal.signal(signal.SIGTERM, on_exit)
+    signal.signal(signal.SIGINT, on_exit)
+    n = 0
+    while True:
+        try:
+            temps = [t for t in (read_temp(p) for p in SENSORS) if t is not None]
+            if not temps:
+                set_auto()                    # can't read temp -> firmware auto
+            else:
+                t = max(temps)
+                d = duty_for(t)
+                set_duty(d)
+                if n % 15 == 0:               # ~every 30s at 2s interval
+                    print("temp=%.0fC -> fan=%d%%" % (t, d), flush=True)
+        except Exception as e:                # never let a control error persist
+            set_auto()
+            print("error: %s -> firmware auto" % e, flush=True)
+        n += 1
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+[Unit]
+Description=Strix Halo direct EC fan control
+After=multi-user.target
+
+[Service]
+Type=simple
+# ec_sys must be loaded with write support so the daemon can drive the EC.
+ExecStartPre=-/sbin/modprobe -r ec_sys
+ExecStartPre=/sbin/modprobe ec_sys write_support=1
+ExecStart=/usr/local/bin/strix-halo-fand
+# On stop, hand the fan back to the firmware's auto curve.
+ExecStopPost=/usr/local/bin/strix-halo-fand --auto
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+dsdt.bin
+dsdt.dat
+dsdt.dsl
+*.pyc
+__pycache__/
