@@ -13,7 +13,9 @@ Fail-safe by design:
     high temp;
   * on ANY error (unreadable temp, EC write failure) or on stop/SIGTERM it writes
     0x00 to hand the fan back to the firmware's own auto curve;
-  * a minimum-duty floor keeps airflow up even if something wedges.
+  * a minimum-duty floor keeps airflow up even if something wedges;
+  * optional Prometheus export is fully isolated -- a telemetry error can never
+    interrupt fan control.
 
 You are still poking an Embedded Controller. Use at your own risk. The worst
 realistic outcome is a fan stuck at 100% (loud, but safe) until reboot.
@@ -31,6 +33,19 @@ FLOOR = 30             # minimum duty %% -- never starve airflow
 CURVE = [(50, 45), (60, 55), (70, 70), (78, 85), (82, 95), (999, 100)]
 # Temp sources: hwmon driver names; the daemon drives off the HOTTEST of these.
 TEMP_SOURCES = ["amdgpu", "k10temp"]
+
+# ---- Optional Prometheus export (opt-in; leave PROM_FILE = None to disable) ----
+# Point PROM_FILE at a file inside node_exporter's --collector.textfile.directory
+# (e.g. "/var/lib/prometheus/node-exporter/strix-halo-fan.prom"). node_exporter
+# then serves these on its OWN /metrics -- no extra port, no extra exporter:
+#   strixhalo_fan_duty_percent{fan="1|2"}
+#   strixhalo_fan_rpm{fan="1|2"}
+#   strixhalo_temp_celsius{sensor="amdgpu|k10temp"}
+PROM_FILE = None
+# Fan tachometer registers per fan as (msb_offset, lsb_offset): rpm = (ec[msb]<<8)|ec[lsb].
+# On the M5/IT5570 the firmware (DSDT) packs fan1 as (byte@0x35 << 8)|byte@0x36 -- note the
+# byte at the LOWER offset is the HIGH byte. Verify the order on your board (see README).
+TACH = [(0x35, 0x36), (0x37, 0x38)]
 # -----------------------------------------------------------------------------
 
 
@@ -44,7 +59,7 @@ def find_hwmon(name):
     return None
 
 
-SENSORS = [p for p in (find_hwmon(n) for n in TEMP_SOURCES) if p]
+SENSORS = [(n, p) for n, p in ((n, find_hwmon(n)) for n in TEMP_SOURCES) if p]
 
 
 def read_temp(path):
@@ -58,6 +73,14 @@ def ec_write(offset, byte):
     with open(EC, "r+b") as f:
         f.seek(offset)
         f.write(bytes([byte]))
+
+
+def ec_read():
+    try:
+        with open(EC, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
 
 
 def set_duty(pct):
@@ -83,6 +106,50 @@ def duty_for(temp):
     return 100
 
 
+# The EC updates the two tach bytes non-atomically, so a single read can tear into
+# garbage. Take two reads ~20ms apart and accept a fan's value only if both agree
+# and are plausible; otherwise hold the last-known-good so the exported series stays
+# continuous instead of dropping samples.
+_last_rpm = {}
+
+
+def read_tach():
+    a = ec_read()
+    time.sleep(0.02)
+    b = ec_read()
+    if a and b:
+        for i, (msb, lsb) in enumerate(TACH):
+            ra = (a[msb] << 8) | a[lsb]
+            rb = (b[msb] << 8) | b[lsb]
+            if 50 <= ra <= 12000 and 50 <= rb <= 12000 and abs(ra - rb) <= 400:
+                _last_rpm[i] = (ra + rb) // 2
+    return _last_rpm
+
+
+def write_metrics(readings, duty):
+    if not PROM_FILE:
+        return
+    try:                                      # telemetry must NEVER break fan control
+        L = ["# TYPE strixhalo_fan_duty_percent gauge"]
+        L.append('strixhalo_fan_duty_percent{fan="1"} %d' % duty)
+        if FAN2 is not None:
+            L.append('strixhalo_fan_duty_percent{fan="2"} %d' % duty)
+        rpm = read_tach()
+        L.append("# TYPE strixhalo_fan_rpm gauge")
+        for i in sorted(rpm):
+            L.append('strixhalo_fan_rpm{fan="%d"} %d' % (i + 1, rpm[i]))
+        L.append("# TYPE strixhalo_temp_celsius gauge")
+        for name, t in readings:
+            L.append('strixhalo_temp_celsius{sensor="%s"} %.1f' % (name, t))
+        tmp = PROM_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write("\n".join(L) + "\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, PROM_FILE)            # atomic swap: never expose a partial file
+    except Exception:
+        pass
+
+
 def on_exit(*_):
     set_auto()
     sys.exit(0)
@@ -100,13 +167,15 @@ def main():
     n = 0
     while True:
         try:
-            temps = [t for t in (read_temp(p) for p in SENSORS) if t is not None]
-            if not temps:
+            readings = [(name, read_temp(p)) for name, p in SENSORS]
+            readings = [(name, t) for name, t in readings if t is not None]
+            if not readings:
                 set_auto()                    # can't read temp -> firmware auto
             else:
-                t = max(temps)
+                t = max(t for _, t in readings)
                 d = duty_for(t)
                 set_duty(d)
+                write_metrics(readings, d)
                 if n % 15 == 0:               # ~every 30s at 2s interval
                     print("temp=%.0fC -> fan=%d%%" % (t, d), flush=True)
         except Exception as e:                # never let a control error persist

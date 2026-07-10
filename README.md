@@ -54,6 +54,13 @@ The fan registers were reverse-engineered from the board's own **ACPI DSDT** —
 | `FAN2` | `0x34` | second fan, same encoding |
 | tach   | `0x35`–`0x38` | fan RPM (read-only; tears on rapid access) |
 
+The tach encoding is easy to get wrong: the firmware packs fan1 as
+`(byte@0x35 << 8) | byte@0x36` — the byte at the *lower* offset is the *high*
+byte. The reads also **tear** (the EC updates the two bytes non-atomically), so
+the daemon reads twice ~20 ms apart, accepts a value only if both reads agree and
+are plausible, and otherwise holds the last-known-good — giving a clean,
+continuous series instead of dropped or spiking samples.
+
 The daemon reads the GPU (`amdgpu`) and CPU (`k10temp`) temperatures every couple
 of seconds, picks a duty from a curve, and writes **both** fans through the
 kernel's `ec_sys` debug interface. Bit 7 = manual override; on this EC the firmware
@@ -111,6 +118,30 @@ FAN2 = 0x34                # set to None for a single-fan board
 
 For a quiet-at-idle box, lower the first curve points (e.g. `(50, 30)`); the daemon
 still slams to 100 % under load.
+
+## Prometheus metrics (optional)
+
+Export is **off by default**. To enable it, point `PROM_FILE` at a file inside your
+[node_exporter](https://github.com/prometheus/node_exporter) **textfile-collector**
+directory and restart the service:
+
+```python
+PROM_FILE = "/var/lib/prometheus/node-exporter/strix-halo-fan.prom"
+```
+
+node_exporter (run with `--collector.textfile.directory=/var/lib/prometheus/node-exporter`)
+then serves these on its **own** `/metrics` — no extra port, no extra exporter, no
+scrape config beyond the node_exporter job you already have:
+
+| Metric | Labels | |
+|--------|--------|--|
+| `strixhalo_fan_duty_percent` | `fan="1\|2"` | commanded duty % |
+| `strixhalo_fan_rpm`          | `fan="1\|2"` | measured RPM (de-teared, see above) |
+| `strixhalo_temp_celsius`     | `sensor="amdgpu\|k10temp"` | the temps driving the curve |
+
+The daemon writes the file atomically (temp + `rename`), so node_exporter never
+reads a half-written file. Export runs inside its own error guard — a telemetry
+failure can never interrupt fan control.
 
 ## Adapting to your board
 
