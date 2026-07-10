@@ -251,8 +251,21 @@ printf '\x00' | sudo dd of=/sys/kernel/debug/ec/ec0/io bs=1 seek=$((0x33)) count
 
 **Never** test a low duty at high temp.
 
-## Related
+## Related / prior art
 
+The Bosgame M5 is a rebrand of the **Sixunited AXB35-02** board (shared with the
+GMKtec EVO-X2, FEVM FA-EX9, and others), all using the **ITE IT5570E** EC — so work
+on any of them applies here.
+
+- [cmetz/ec-su_axb35-linux](https://github.com/cmetz/ec-su_axb35-linux) — a proper
+  **hwmon kernel driver** for this EC (fan1/2/3 + auto/fixed/curve modes). If you
+  want a fully-integrated `hwmon` device, use this. This project is a deliberately
+  simpler, dependency-free **userspace** alternative: one file, easy to read and
+  adapt, no module build.
+- [deseven's Strix Halo wiki](https://strixhalo.wiki/Hardware/Boards/Sixunited_AXB35) —
+  EC register documentation and downloadable **BIOS + standalone EC firmware images**
+  (EC v1.04–1.10). EC 1.04 introduced manual fan control (the `0x80|duty` override
+  used here); 1.10 added custom fan curves.
 - [RyzenAdj](https://github.com/FlyGoat/RyzenAdj) — CPU undervolt / power-limit
   tuning (the `--set-coall` curve-optimiser pairs perfectly with this for Strix
   Halo thermals). Note: iGPU undervolt (`--set-cogfx`) is **not** supported on
